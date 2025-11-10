@@ -27,6 +27,7 @@ dependencies = [
     'wandb',
     'tiktoken',
     'tensorboard',
+    'cloudpickle',
 ]
 
 [project.optional-dependencies]
