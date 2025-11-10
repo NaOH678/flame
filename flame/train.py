@@ -8,9 +8,11 @@ import json
 import os
 import time
 from datetime import timedelta
+from typing import Dict, List, Optional, Tuple
 
 import fla  # noqa
 import torch
+import torch.nn.functional as F
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
 from fla.ops.utils import prepare_position_ids
 from torch.distributed.elastic.multiprocessing.errors import record
@@ -40,6 +42,150 @@ from flame.tools.utils import get_nparams_and_flops
 
 def build_tokenizer(job_config: JobConfig) -> AutoTokenizer:
     return AutoTokenizer.from_pretrained(job_config.model.tokenizer_path)
+
+
+def grpo_rollout_step(
+    model: AutoModelForCausalLM,
+    batch: Dict[str, torch.Tensor],
+    device: torch.device,
+    grad_accum_steps: int,
+    amp_context,
+    train_context,
+    rollout_length: int,
+    rollout_repeats: int,
+    kl_beta: float = 0.0,
+    reference_model: Optional[AutoModelForCausalLM] = None,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    if rollout_length <= 0:
+        raise ValueError("rollout_length must be positive for GRPO training")
+    repeats = max(1, int(rollout_repeats))
+
+    context_ids = batch["context_input_ids"].to(device=device)
+    context_mask = batch["context_attention_mask"].to(device=device, dtype=torch.long)
+    target_ids = batch["target_ids"].to(device=device)
+
+    batch_size = context_ids.size(0)
+
+    expanded_context = context_ids.repeat_interleave(repeats, dim=0)
+    expanded_mask = context_mask.repeat_interleave(repeats, dim=0)
+    expanded_target = target_ids.repeat_interleave(repeats, dim=0)
+
+    with torch.no_grad():
+        rollout_outputs = model(
+            input_ids=expanded_context,
+            attention_mask=expanded_mask,
+            use_cache=True,
+        )
+        past_key_values = rollout_outputs.past_key_values
+        logits = rollout_outputs.logits[:, -1, :]
+        sampled_tokens: List[torch.Tensor] = []
+        current_mask = expanded_mask
+        for _ in range(rollout_length):
+            probs = torch.softmax(logits, dim=-1)
+            tokens = torch.multinomial(probs, num_samples=1)
+            sampled_tokens.append(tokens)
+            current_mask = torch.cat(
+                [
+                    current_mask,
+                    torch.ones(
+                        current_mask.size(0),
+                        1,
+                        dtype=current_mask.dtype,
+                        device=current_mask.device,
+                    ),
+                ],
+                dim=1,
+            )
+            rollout_outputs = model(
+                input_ids=tokens,
+                attention_mask=current_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = rollout_outputs.past_key_values
+            logits = rollout_outputs.logits[:, -1, :]
+
+    generated_tokens = torch.cat(sampled_tokens, dim=1)
+    full_input = torch.cat([expanded_context, generated_tokens], dim=1)
+    rollout_mask = torch.cat(
+        [
+            expanded_mask,
+            torch.ones(
+                generated_tokens.size(0),
+                generated_tokens.size(1),
+                dtype=expanded_mask.dtype,
+                device=expanded_mask.device,
+            ),
+        ],
+        dim=1,
+    )
+
+    with train_context(None):
+        with amp_context:
+            policy_outputs = model(
+                input_ids=full_input,
+                attention_mask=rollout_mask,
+                use_cache=False,
+            )
+            policy_logits = policy_outputs.logits[:, -rollout_length:, :]
+            log_probs = F.log_softmax(policy_logits, dim=-1)
+            action_log_probs = torch.gather(
+                log_probs,
+                dim=-1,
+                index=generated_tokens.unsqueeze(-1),
+            ).squeeze(-1)
+
+    rewards = (generated_tokens[:, -1] == expanded_target[:, -1]).to(dtype=torch.float32)
+    grouped_rewards = rewards.view(batch_size, repeats)
+    reward_mean = grouped_rewards.mean(dim=1, keepdim=True)
+    reward_std = grouped_rewards.std(dim=1, unbiased=False, keepdim=True)
+    normalized_adv = torch.zeros_like(grouped_rewards)
+    if grouped_rewards.numel() > 0:
+        normalized_adv = torch.where(
+            reward_std > 0,
+            (grouped_rewards - reward_mean) / (reward_std + 1e-6),
+            torch.zeros_like(grouped_rewards),
+        )
+    advantage_tokens = normalized_adv.view(-1, 1).repeat(1, rollout_length)
+
+    policy_loss = -((advantage_tokens * action_log_probs).sum(dim=1)).mean()
+
+    kl_term = torch.tensor(0.0, device=device)
+    kl_metric = 0.0
+    if reference_model is not None and kl_beta > 0:
+        with torch.no_grad():
+            ref_outputs = reference_model(
+                input_ids=full_input.detach(),
+                attention_mask=rollout_mask.detach(),
+                use_cache=False,
+            )
+            ref_logits = ref_outputs.logits[:, -rollout_length:, :]
+            ref_log_probs = F.log_softmax(ref_logits, dim=-1)
+            ref_action_log_probs = torch.gather(
+                ref_log_probs,
+                dim=-1,
+                index=generated_tokens.unsqueeze(-1),
+            ).squeeze(-1)
+        kl_term = (action_log_probs - ref_action_log_probs).mean()
+        kl_metric = kl_term.detach().item()
+
+    total_loss = policy_loss + kl_beta * kl_term
+    scaled_loss = total_loss / grad_accum_steps
+
+    stats = {
+        "reward_mean": reward_mean.mean().item() if reward_mean.numel() > 0 else 0.0,
+        "reward_std": reward_std.mean().item() if reward_std.numel() > 0 else 0.0,
+        "success_rate": rewards.mean().item() if rewards.numel() > 0 else 0.0,
+        "advantage_abs_mean": advantage_tokens.abs().mean().item()
+        if advantage_tokens.numel() > 0
+        else 0.0,
+        "policy_loss": policy_loss.detach().item(),
+        "token_count": float(rollout_mask.sum().item()),
+    }
+    if reference_model is not None and kl_beta > 0:
+        stats["kl_mean"] = kl_metric
+
+    return scaled_loss, stats
 
 
 register_train_spec(
@@ -133,6 +279,15 @@ def main(job_config: JobConfig):
         """
         pp_mesh = world_mesh["pp"]
 
+    if job_config.training.rl_enabled and (
+        parallel_dims.cp_enabled
+        or parallel_dims.tp_enabled
+        or parallel_dims.loss_parallel_enabled
+    ):
+        raise NotImplementedError(
+            "GRPO training currently supports only data parallel execution"
+        )
+
     # Set random seed, and maybe enable deterministic mode (mainly for debugging, expect perf loss)
     dist_utils.set_determinism(
         world_mesh, device, job_config.training.seed, job_config.training.deterministic
@@ -175,6 +330,10 @@ def main(job_config: JobConfig):
         seq_len=job_config.training.seq_len,
         context_len=job_config.training.context_len,
         varlen=job_config.training.varlen,
+        rl_enabled=job_config.training.rl_enabled,
+        rl_anchors_per_sample=job_config.training.anchors_per_sample,
+        rl_rollout_length=job_config.training.rollout_length,
+        rl_max_context_tokens=job_config.training.max_context_tokens,
         num_workers=job_config.training.num_workers,
         pin_memory=job_config.training.pin_memory,
         persistent_workers=job_config.training.persistent_workers,
@@ -282,6 +441,23 @@ def main(job_config: JobConfig):
         model.train()
 
         model_parts = [model]
+
+    reference_model = None
+    if job_config.training.rl_enabled and job_config.training.reference_model_path:
+        logger.info(
+            f"Loading reference model from {job_config.training.reference_model_path}"
+        )
+        reference_model = AutoModelForCausalLM.from_pretrained(
+            job_config.training.reference_model_path,
+            trust_remote_code=True,
+        )
+        reference_model.to(
+            device=device,
+            dtype=next(model.parameters()).dtype,
+        )
+        reference_model.eval()
+        for param in reference_model.parameters():
+            param.requires_grad_(False)
 
     device_mem_stats = device_memory_monitor.get_peak_stats()
     logger.info(
@@ -408,21 +584,44 @@ def main(job_config: JobConfig):
             optimizers.zero_grad()
 
             losses = []
+            aggregated_rl_stats = {} if job_config.training.rl_enabled else None
             # do gradient accumulation if enabled
             for _ in range(job_config.training.gradient_accumulation_steps):
-                # get batch
                 data_load_start = time.perf_counter()
                 batch = next(data_iterator)
-                input_ids, labels = batch["input_ids"], batch["labels"]
-
-                # Update metrics processor state before forward/backward
-                metric_logger.ntokens_since_last_log += labels.numel()
                 metric_logger.data_loading_times.append(
                     time.perf_counter() - data_load_start
                 )
 
-                input_ids = input_ids.to(device_type)
+                if job_config.training.rl_enabled:
+                    loss, step_stats = grpo_rollout_step(
+                        model=model,
+                        batch=batch,
+                        device=device,
+                        grad_accum_steps=job_config.training.gradient_accumulation_steps,
+                        amp_context=maybe_enable_amp,
+                        train_context=train_context,
+                        rollout_length=job_config.training.rollout_length,
+                        rollout_repeats=job_config.training.rollout_repeats,
+                        kl_beta=job_config.training.kl_beta,
+                        reference_model=reference_model,
+                    )
+                    token_count = int(step_stats.pop("token_count", 0.0))
+                    metric_logger.ntokens_since_last_log += token_count
+                    losses.append(loss)
+                    loss.backward()
+                    if aggregated_rl_stats is None:
+                        aggregated_rl_stats = {}
+                    for key, value in step_stats.items():
+                        aggregated_rl_stats[key] = aggregated_rl_stats.get(key, 0.0) + value
+                    continue
 
+                input_ids, labels = batch["input_ids"], batch["labels"]
+
+                # Update metrics processor state before forward/backward
+                metric_logger.ntokens_since_last_log += labels.numel()
+
+                input_ids = input_ids.to(device_type)
                 """
                 TODO[flame]: We need to carefully handle the position_ids for TP/CP
                 Depending on the Models'PE, the position_ids might be different.
@@ -504,6 +703,13 @@ def main(job_config: JobConfig):
 
                 losses.append(loss)
             loss = sum(losses)
+            rl_stats_for_logging: Dict[str, float] = {}
+            if job_config.training.rl_enabled and aggregated_rl_stats:
+                rl_stats_for_logging = {
+                    key: aggregated_rl_stats[key]
+                    / job_config.training.gradient_accumulation_steps
+                    for key in aggregated_rl_stats
+                }
 
             # clip gradients
             grad_norm = dist_utils.clip_grad_norm_(
@@ -572,21 +778,40 @@ def main(job_config: JobConfig):
                     * (job_config.training.steps - train_state.step)
                     / train_state.step
                 )
+                extra_metrics = {
+                    "optimizer/lr": last_lr,
+                    "optimizer/grad_norm": grad_norm.item(),
+                    "optimizer/skipped_step": train_state.skipped_step,
+                }
+                if job_config.training.rl_enabled and rl_stats_for_logging:
+                    for key, value in rl_stats_for_logging.items():
+                        extra_metrics[f"rl/{key}"] = value
+
                 metric_logger.log(
                     train_state.step,
                     global_avg_loss,
                     global_max_loss,
-                    extra_metrics={
-                        "optimizer/lr": last_lr,
-                        "optimizer/grad_norm": grad_norm.item(),
-                        "optimizer/skipped_step": train_state.skipped_step,
-                    },
+                    extra_metrics=extra_metrics,
                 )
 
-                logger.info(
+                log_message = (
                     f"{color.blue}lr: {last_lr:.4e} gnorm: {grad_norm:5.2f} "
-                    f"{color.magenta}[{str(train_state.elapsed).split('.')[0]:>8}<{str(eta).split('.')[0]:>8}]{color.reset}"
                 )
+                if job_config.training.rl_enabled and rl_stats_for_logging:
+                    log_message += (
+                        f"reward: {rl_stats_for_logging.get('reward_mean', 0.0):.3f} "
+                        f"success: {rl_stats_for_logging.get('success_rate', 0.0):.3f} "
+                    )
+                    if "kl_mean" in rl_stats_for_logging:
+                        log_message += (
+                            f"kl: {rl_stats_for_logging.get('kl_mean', 0.0):.3f} "
+                        )
+                log_message += (
+                    f"{color.magenta}[{str(train_state.elapsed).split('.')[0]:>8}"
+                    f"<{str(eta).split('.')[0]:>8}]{color.reset}"
+                )
+
+                logger.info(log_message)
 
             checkpoint.save(
                 train_state.step, force=(train_state.step == job_config.training.steps)
