@@ -5,6 +5,8 @@ import argparse
 from pathlib import Path
 from typing import Optional
 
+import shutil
+
 import torch
 import torch.distributed.checkpoint as DCP
 from transformers import AutoModelForCausalLM
@@ -42,6 +44,7 @@ def _ensure_lm_head_weight(model, state_dict: dict) -> None:
     """Add ``lm_head.weight`` to ``state_dict`` if it is absent."""
 
     if "lm_head.weight" in state_dict:
+        logger.info("'lm_head.weight' already present in checkpoint payload")
         return
 
     lm_head = getattr(model, "lm_head", None)
@@ -61,13 +64,15 @@ def _ensure_lm_head_weight(model, state_dict: dict) -> None:
         logger.info(
             "Tying 'lm_head.weight' to existing embedding weight at key '%s'", embed_key
         )
-        state_dict["lm_head.weight"] = state_dict[embed_key]
-        return
+        state_dict["lm_head.weight"] = state_dict[embed_key].clone()
+    else:
+        state_dict["lm_head.weight"] = lm_head.weight.detach().to(device="cpu")
+        logger.info(
+            "Added missing 'lm_head.weight' from the model's output embeddings module"
+        )
 
-    state_dict["lm_head.weight"] = lm_head.weight.detach().to(device="cpu")
-    logger.info(
-        "Added missing 'lm_head.weight' from the model's output embeddings module"
-    )
+    if "lm_head.weight" not in state_dict:
+        raise RuntimeError("Failed to materialize 'lm_head.weight' in converted checkpoint")
 
 
 def convert_hf_weights(model: str, checkpoint: Path, dtype: Optional[str]):
@@ -80,14 +85,15 @@ def convert_hf_weights(model: str, checkpoint: Path, dtype: Optional[str]):
     )
     if torch_dtype is not None:
         model.to(dtype=torch_dtype)
-    state_dict = {
-        key: tensor.detach().to(device="cpu")
-        for key, tensor in model.state_dict().items()
-    }
+    state_dict = dict(model.state_dict())
+    for key, tensor in list(state_dict.items()):
+        state_dict[key] = tensor.detach().to(device="cpu")
 
     _ensure_lm_head_weight(model, state_dict)
 
     logger.info(f"Writing to DCP at '{checkpoint}'")
+    if checkpoint.exists():
+        shutil.rmtree(checkpoint)
     checkpoint.mkdir(parents=True, exist_ok=True)
     storage_writer = DCP.filesystem.FileSystemWriter(checkpoint, thread_count=8)
     DCP.save({"model": state_dict}, storage_writer=storage_writer)
