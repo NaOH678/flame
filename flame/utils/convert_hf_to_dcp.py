@@ -95,8 +95,13 @@ def convert_hf_weights(model: str, checkpoint: Path, dtype: Optional[str]):
     if checkpoint.exists():
         shutil.rmtree(checkpoint)
     checkpoint.mkdir(parents=True, exist_ok=True)
+
+    # ``torch.distributed.checkpoint`` persists keys exactly as they are provided in the
+    # state dict.  The training loader expects the raw parameter names (e.g.
+    # ``lm_head.weight``) instead of a "model."-prefixed namespace, so we hand the
+    # flat state dict directly to the saver instead of nesting it under an extra key.
     storage_writer = DCP.filesystem.FileSystemWriter(checkpoint, thread_count=8)
-    DCP.save({"model": state_dict}, storage_writer=storage_writer)
+    DCP.save(state_dict, storage_writer=storage_writer)
 
 
 if __name__ == "__main__":
