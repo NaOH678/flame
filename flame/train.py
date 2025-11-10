@@ -79,23 +79,26 @@ def grpo_rollout_step(
         past_key_values = rollout_outputs.past_key_values
         logits = rollout_outputs.logits[:, -1, :]
         sampled_tokens: List[torch.Tensor] = []
-        current_mask = expanded_mask
-        for _ in range(rollout_length):
+
+        mask_buffer = torch.cat(
+            [
+                expanded_mask,
+                torch.zeros(
+                    expanded_mask.size(0),
+                    rollout_length,
+                    dtype=expanded_mask.dtype,
+                    device=expanded_mask.device,
+                ),
+            ],
+            dim=1,
+        )
+        base_length = expanded_context.size(1)
+        for step in range(rollout_length):
             probs = torch.softmax(logits, dim=-1)
             tokens = torch.multinomial(probs, num_samples=1)
             sampled_tokens.append(tokens)
-            current_mask = torch.cat(
-                [
-                    current_mask,
-                    torch.ones(
-                        current_mask.size(0),
-                        1,
-                        dtype=current_mask.dtype,
-                        device=current_mask.device,
-                    ),
-                ],
-                dim=1,
-            )
+            mask_buffer[:, base_length + step] = 1
+            current_mask = mask_buffer[:, : base_length + step + 1]
             rollout_outputs = model(
                 input_ids=tokens,
                 attention_mask=current_mask,
@@ -107,18 +110,7 @@ def grpo_rollout_step(
 
     generated_tokens = torch.cat(sampled_tokens, dim=1)
     full_input = torch.cat([expanded_context, generated_tokens], dim=1)
-    rollout_mask = torch.cat(
-        [
-            expanded_mask,
-            torch.ones(
-                generated_tokens.size(0),
-                generated_tokens.size(1),
-                dtype=expanded_mask.dtype,
-                device=expanded_mask.device,
-            ),
-        ],
-        dim=1,
-    )
+    rollout_mask = mask_buffer[:, : full_input.size(1)]
 
     with train_context(None):
         with amp_context:
