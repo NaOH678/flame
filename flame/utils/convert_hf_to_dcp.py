@@ -85,7 +85,7 @@ def convert_hf_weights(model: str, checkpoint: Path, dtype: Optional[str]):
     )
     if torch_dtype is not None:
         model.to(dtype=torch_dtype)
-    state_dict = dict(model.state_dict())
+    state_dict = model.state_dict()
     for key, tensor in list(state_dict.items()):
         state_dict[key] = tensor.detach().to(device="cpu")
 
