@@ -281,6 +281,47 @@ class JobConfig:
             help="Whether to take sequences of variable length as input",
         )
         self.parser.add_argument(
+            "--training.rl_enabled",
+            action="store_true",
+            help="Enable reinforcement learning with GRPO objectives",
+        )
+        self.parser.add_argument(
+            "--training.rollout_length",
+            type=int,
+            default=4,
+            help="Number of tokens generated per rollout when GRPO is enabled",
+        )
+        self.parser.add_argument(
+            "--training.rollout_repeats",
+            type=int,
+            default=4,
+            help="Number of rollout samples drawn per anchor for GRPO",
+        )
+        self.parser.add_argument(
+            "--training.anchors_per_sample",
+            type=int,
+            default=2,
+            help="Number of anchors to sample from each sequence for GRPO",
+        )
+        self.parser.add_argument(
+            "--training.max_context_tokens",
+            type=int,
+            default=None,
+            help="Optional limit on context tokens retained before each anchor during GRPO",
+        )
+        self.parser.add_argument(
+            "--training.kl_beta",
+            type=float,
+            default=0.0,
+            help="KL regularization coefficient applied during GRPO",
+        )
+        self.parser.add_argument(
+            "--training.reference_model_path",
+            type=str,
+            default=None,
+            help="Optional reference model checkpoint used for KL regularization in GRPO",
+        )
+        self.parser.add_argument(
             "--training.gradient_accumulation_steps",
             type=int,
             default=1,

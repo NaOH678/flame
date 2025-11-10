@@ -14,6 +14,7 @@ import torch
 from datasets import Dataset, IterableDataset, interleave_datasets, load_dataset
 from datasets.iterable_dataset import ShufflingConfig
 from torch.distributed.checkpoint.stateful import Stateful
+from torch.nn.utils.rnn import pad_sequence
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizer
 
@@ -498,6 +499,116 @@ class DataCollatorForLanguageModeling:
         return batch
 
 
+@dataclass
+class DataCollatorForRollout:
+    tokenizer: PreTrainedTokenizer
+    anchors_per_sample: int
+    rollout_length: int
+    max_context_tokens: Optional[int] = None
+
+    def __post_init__(self):
+        if self.anchors_per_sample <= 0:
+            raise ValueError("anchors_per_sample must be positive")
+        if self.rollout_length <= 0:
+            raise ValueError("rollout_length must be positive")
+        if self.tokenizer.pad_token_id is not None:
+            self.pad_token_id = self.tokenizer.pad_token_id
+        elif self.tokenizer.eos_token_id is not None:
+            self.pad_token_id = self.tokenizer.eos_token_id
+        else:
+            raise ValueError(
+                "Tokenizer must provide either a pad_token_id or eos_token_id for rollout collation"
+            )
+
+    def _tensorize(self, values: Union[List[int], np.ndarray, torch.Tensor]) -> torch.Tensor:
+        if isinstance(values, torch.Tensor):
+            return values.to(dtype=torch.long)
+        if isinstance(values, np.ndarray):
+            return torch.from_numpy(values).to(dtype=torch.long)
+        return torch.tensor(values, dtype=torch.long)
+
+    def __call__(self, examples: List[Union[List[int], Dict[str, Any]]]) -> Dict[str, Any]:
+        contexts: List[torch.Tensor] = []
+        targets: List[torch.Tensor] = []
+        context_lengths: List[int] = []
+
+        for example in examples:
+            if not isinstance(example, Dict):
+                tokens = self._tensorize(example)
+            else:
+                tokens = self._tensorize(example["input_ids"])
+
+            total_len = tokens.numel()
+            if total_len <= self.rollout_length + 1:
+                continue
+
+            max_start = total_len - self.rollout_length
+            candidates = torch.arange(1, max_start + 1, dtype=torch.long)
+            if candidates.numel() == 0:
+                continue
+            num_samples = min(self.anchors_per_sample, candidates.numel())
+            selected = candidates[torch.randperm(candidates.numel())[:num_samples]]
+            selected, _ = torch.sort(selected)
+
+            for start in selected.tolist():
+                context = tokens[:start]
+                if context.numel() == 0:
+                    continue
+                if self.max_context_tokens is not None and context.numel() > self.max_context_tokens:
+                    context = context[-self.max_context_tokens :]
+                target = tokens[start : start + self.rollout_length]
+                if target.numel() != self.rollout_length:
+                    continue
+                contexts.append(context)
+                targets.append(target)
+                context_lengths.append(context.numel())
+
+        if not contexts:
+            # fallback: use the tail of the last example if possible
+            for example in reversed(examples):
+                tokens = (
+                    self._tensorize(example)
+                    if not isinstance(example, Dict)
+                    else self._tensorize(example["input_ids"])
+                )
+                total_len = tokens.numel()
+                if total_len <= self.rollout_length + 1:
+                    continue
+                start = max(1, total_len - self.rollout_length - 1)
+                context = tokens[:start]
+                if context.numel() == 0:
+                    continue
+                if self.max_context_tokens is not None and context.numel() > self.max_context_tokens:
+                    context = context[-self.max_context_tokens :]
+                target = tokens[start : start + self.rollout_length]
+                if target.numel() != self.rollout_length:
+                    continue
+                contexts.append(context)
+                targets.append(target)
+                context_lengths.append(context.numel())
+                break
+
+        if not contexts:
+            raise ValueError("Unable to sample rollout anchors from the provided batch")
+
+        attention_masks = [torch.ones_like(context, dtype=torch.long) for context in contexts]
+        context_input_ids = pad_sequence(
+            contexts, batch_first=True, padding_value=self.pad_token_id
+        )
+        context_attention_mask = pad_sequence(
+            attention_masks, batch_first=True, padding_value=0
+        )
+        target_ids = torch.stack(targets, dim=0)
+        context_lengths_tensor = torch.tensor(context_lengths, dtype=torch.long)
+
+        return {
+            "context_input_ids": context_input_ids,
+            "context_attention_mask": context_attention_mask,
+            "target_ids": target_ids,
+            "context_lengths": context_lengths_tensor,
+        }
+
+
 class ParallelAwareDataLoader(StatefulDataLoader, Stateful):
     """
     A wrapper around the StatefulDataLoader that ensures that the state is stored only once per DP rank.
@@ -736,6 +847,10 @@ def build_dataloader(
     seq_len: int,
     context_len: Optional[int] = None,
     varlen: bool = False,
+    rl_enabled: bool = False,
+    rl_anchors_per_sample: int = 1,
+    rl_rollout_length: int = 1,
+    rl_max_context_tokens: Optional[int] = None,
     num_workers: int = 0,
     pin_memory: bool = False,
     persistent_workers: bool = False,
@@ -744,11 +859,27 @@ def build_dataloader(
     dataset = OnlineTokenizedIterableDataset(
         dataset=dataset, tokenizer=tokenizer, seq_len=seq_len, rank=rank, world_size=world_size
     )
+    if rl_enabled and varlen:
+        raise ValueError("Variable length batching is not supported with GRPO training")
+
+    collate_fn: Callable
+    if rl_enabled:
+        collate_fn = DataCollatorForRollout(
+            tokenizer=tokenizer,
+            anchors_per_sample=rl_anchors_per_sample,
+            rollout_length=rl_rollout_length,
+            max_context_tokens=rl_max_context_tokens,
+        )
+    else:
+        collate_fn = DataCollatorForLanguageModeling(
+            tokenizer=tokenizer, context_len=context_len, varlen=varlen
+        )
+
     return ParallelAwareDataLoader(
         rank=rank,
         dataset=dataset,
         batch_size=batch_size,
-        collate_fn=DataCollatorForLanguageModeling(tokenizer=tokenizer, context_len=context_len, varlen=varlen),
+        collate_fn=collate_fn,
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
