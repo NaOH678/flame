@@ -20,6 +20,56 @@ TORCH_DTYPE_MAP = {
 
 
 @torch.inference_mode()
+def _maybe_find_embedding_key(state_dict: dict) -> Optional[str]:
+    """Best-effort detection of the tied embedding weight key."""
+
+    preferred_suffixes = (
+        "tok_embeddings.weight",
+        "word_embeddings.weight",
+        "wte.weight",
+        "embed_tokens.weight",
+        "embeddings.word_embeddings.weight",
+    )
+
+    for suffix in preferred_suffixes:
+        for key in state_dict:
+            if key.endswith(suffix):
+                return key
+    return None
+
+
+def _ensure_lm_head_weight(model, state_dict: dict) -> None:
+    """Add ``lm_head.weight`` to ``state_dict`` if it is absent."""
+
+    if "lm_head.weight" in state_dict:
+        return
+
+    lm_head = getattr(model, "lm_head", None)
+    if lm_head is None and hasattr(model, "get_output_embeddings"):
+        lm_head = model.get_output_embeddings()
+
+    if lm_head is None or not hasattr(lm_head, "weight"):
+        logger.warning(
+            "The converted checkpoint is missing 'lm_head.weight' and the model does "
+            "not expose an output embedding weight. The resulting checkpoint may fail "
+            "to load if the training graph expects this parameter."
+        )
+        return
+
+    embed_key = _maybe_find_embedding_key(state_dict)
+    if embed_key is not None:
+        logger.info(
+            "Tying 'lm_head.weight' to existing embedding weight at key '%s'", embed_key
+        )
+        state_dict["lm_head.weight"] = state_dict[embed_key]
+        return
+
+    state_dict["lm_head.weight"] = lm_head.weight.detach().to(device="cpu")
+    logger.info(
+        "Added missing 'lm_head.weight' from the model's output embeddings module"
+    )
+
+
 def convert_hf_weights(model: str, checkpoint: Path, dtype: Optional[str]):
     torch_dtype = TORCH_DTYPE_MAP.get(dtype) if dtype else None
     logger.info(f"Loading model from {model}")
@@ -34,6 +84,8 @@ def convert_hf_weights(model: str, checkpoint: Path, dtype: Optional[str]):
         key: tensor.detach().to(device="cpu")
         for key, tensor in model.state_dict().items()
     }
+
+    _ensure_lm_head_weight(model, state_dict)
 
     logger.info(f"Writing to DCP at '{checkpoint}'")
     checkpoint.mkdir(parents=True, exist_ok=True)
