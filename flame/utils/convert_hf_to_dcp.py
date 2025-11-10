@@ -9,6 +9,7 @@ import shutil
 
 import torch
 import torch.distributed.checkpoint as DCP
+from torch.distributed.checkpoint.filesystem import FileSystemReader
 from transformers import AutoModelForCausalLM
 
 import fla  # noqa
@@ -75,6 +76,26 @@ def _ensure_lm_head_weight(model, state_dict: dict) -> None:
         raise RuntimeError("Failed to materialize 'lm_head.weight' in converted checkpoint")
 
 
+def _verify_lm_head_written(checkpoint: Path, state_dict: dict) -> None:
+    if "lm_head.weight" not in state_dict:
+        logger.warning(
+            "Skip verifying 'lm_head.weight' because it is absent from the state dict"
+        )
+        return
+
+    probe = {"lm_head.weight": torch.empty_like(state_dict["lm_head.weight"])}
+    try:
+        DCP.load(probe, storage_reader=FileSystemReader(checkpoint))
+    except Exception as exc:  # pragma: no cover - exercised in user workflow
+        raise RuntimeError(
+            "Failed to read back 'lm_head.weight' from the freshly written checkpoint."
+        ) from exc
+    else:
+        logger.info(
+            "Verified that 'lm_head.weight' can be read back from %s", checkpoint
+        )
+
+
 def convert_hf_weights(model: str, checkpoint: Path, dtype: Optional[str]):
     torch_dtype = TORCH_DTYPE_MAP.get(dtype) if dtype else None
     logger.info(f"Loading model from {model}")
@@ -102,6 +123,8 @@ def convert_hf_weights(model: str, checkpoint: Path, dtype: Optional[str]):
     # flat state dict directly to the saver instead of nesting it under an extra key.
     storage_writer = DCP.filesystem.FileSystemWriter(checkpoint, thread_count=8)
     DCP.save(state_dict, storage_writer=storage_writer)
+
+    _verify_lm_head_written(checkpoint, state_dict)
 
 
 if __name__ == "__main__":
