@@ -48,6 +48,19 @@ def _serialize_conversations(conversations: Any) -> str:
     return str(conversations)
 
 
+def _normalize_conversation(sample: Dict[str, Any]) -> Optional[Sequence[Dict[str, Any]]]:
+    conversation = sample.get("conversation") or sample.get("conversations")
+    if conversation is None:
+        return None
+    if isinstance(conversation, dict):
+        return [conversation]
+    if isinstance(conversation, Sequence) and not isinstance(
+        conversation, (str, bytes, bytearray)
+    ):
+        return conversation
+    return None
+
+
 def _extract_text(sample: Dict[str, Any]) -> str:
     """Extract textual content from a dataset sample."""
 
@@ -55,10 +68,12 @@ def _extract_text(sample: Dict[str, Any]) -> str:
         text = sample['text']
     elif sample.get('content') not in (None, ''):
         text = sample['content']
-    elif sample.get('conversations') is not None:
-        text = _serialize_conversations(sample['conversations'])
     else:
-        raise ValueError(f"No usable text field found in sample:\n{sample}")
+        conversation = _normalize_conversation(sample)
+        if conversation is not None:
+            text = _serialize_conversations(conversation)
+        else:
+            raise ValueError(f"No usable text field found in sample:\n{sample}")
 
     if isinstance(text, str):
         return text
@@ -66,6 +81,56 @@ def _extract_text(sample: Dict[str, Any]) -> str:
         return _stringify_sequence(text)
     return str(text)
 
+
+def _stringify_optional_field(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        return _stringify_sequence(value)
+    return str(value)
+
+
+def _serialize_tagged_conversation(sample: Dict[str, Any]) -> Optional[str]:
+    conversation = _normalize_conversation(sample)
+    if conversation is None:
+        return None
+
+    role_mapping = {
+        "human": "user",
+        "user": "user",
+        "assistant": "assistant",
+        "gpt": "assistant",
+        "model": "assistant",
+    }
+
+    parts: List[str] = []
+    for turn in conversation:
+        if not isinstance(turn, dict):
+            continue
+
+        raw_role = (
+            turn.get("from")
+            or turn.get("role")
+            or turn.get("speaker")
+            or ""
+        )
+        normalized_role = role_mapping.get(str(raw_role).lower())
+        if normalized_role is None:
+            continue
+
+        value = turn.get("value") or turn.get("content") or turn.get("text")
+        text = _stringify_optional_field(value)
+        if not text:
+            continue
+
+        parts.append(f"<{normalized_role}>{text}</{normalized_role}>")
+
+    if parts:
+        return "\n".join(parts)
+
+    return None
 
 class BufferShuffledIterableDataset(IterableDataset):
     def __init__(
@@ -251,6 +316,158 @@ class OnlineTokenizedIterableDataset(IterableDataset):
     def load_state_dict(self, state_dict):
         self.states = state_dict['states']
         self.tokens = deepcopy(state_dict['tokens'])
+
+
+class RolloutAnchorIterableDataset(IterableDataset):
+    def __init__(
+        self,
+        dataset: Dataset,
+        tokenizer: PreTrainedTokenizer,
+        anchors_per_sample: int,
+        rollout_length: int,
+        max_context_tokens: Optional[int] = None,
+        rank: int = 0,
+        world_size: int = 1,
+        seed: int = 0,
+    ) -> None:
+        if anchors_per_sample <= 0:
+            raise ValueError("anchors_per_sample must be positive")
+        if rollout_length <= 0:
+            raise ValueError("rollout_length must be positive")
+
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.anchors_per_sample = anchors_per_sample
+        self.rollout_length = rollout_length
+        self.max_context_tokens = max_context_tokens
+        self.rank = rank
+        self.world_size = world_size
+        self.seed = seed
+
+        self.data = dataset.shard(world_size, rank)
+
+        self.states = None
+        self.rng_state: Optional[torch.Tensor] = None
+        self._epoch = 0
+
+        self._cached_contexts: List[torch.Tensor] = []
+        self._cached_targets: List[torch.Tensor] = []
+        self._cache_index: int = 0
+
+    def _tokenize_sample(self, sample: Dict[str, Any]) -> torch.Tensor:
+        text = _serialize_tagged_conversation(sample)
+        if text is None:
+            text = _extract_text(sample)
+        encoded = self.tokenizer(text, return_attention_mask=False, add_special_tokens=True)
+        return torch.tensor(encoded["input_ids"], dtype=torch.long)
+
+    def _sample_anchors(
+        self, tokens: torch.Tensor, generator: torch.Generator
+    ) -> List[Dict[str, torch.Tensor]]:
+        total_len = tokens.numel()
+        if total_len <= self.rollout_length + 1:
+            return []
+
+        max_start = total_len - self.rollout_length
+        if max_start <= 0:
+            return []
+
+        candidates = torch.arange(1, max_start + 1, dtype=torch.long)
+        if candidates.numel() == 0:
+            return []
+
+        sample_count = min(self.anchors_per_sample, candidates.numel())
+        perm = torch.randperm(candidates.numel(), generator=generator)[:sample_count]
+        selected = torch.sort(candidates[perm])[0]
+
+        anchor_samples: List[Dict[str, torch.Tensor]] = []
+        for start in selected.tolist():
+            context = tokens[:start]
+            if context.numel() == 0:
+                continue
+            if self.max_context_tokens is not None and context.numel() > self.max_context_tokens:
+                context = context[-self.max_context_tokens :]
+            target = tokens[start : start + self.rollout_length]
+            if target.numel() != self.rollout_length:
+                continue
+            anchor_samples.append(
+                {
+                    "context_ids": context.clone(),
+                    "target_ids": target.clone(),
+                }
+            )
+
+        return anchor_samples
+
+    def _yield_cached(self) -> Iterable[Dict[str, torch.Tensor]]:
+        while self._cache_index < len(self._cached_contexts):
+            context = self._cached_contexts[self._cache_index].clone()
+            target = self._cached_targets[self._cache_index].clone()
+            self._cache_index += 1
+            yield {"context_ids": context, "target_ids": target}
+
+    def _reset_cache(self) -> None:
+        self._cached_contexts = []
+        self._cached_targets = []
+        self._cache_index = 0
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self._epoch + self.rank)
+        if self.rng_state is not None:
+            generator.set_state(self.rng_state)
+
+        if self.states is not None:
+            self.data.load_state_dict(self.states)
+
+        for cached in self._yield_cached():
+            yield cached
+
+        self._reset_cache()
+
+        for sample in self.data:
+            self.states = self.data.state_dict()
+            tokens = self._tokenize_sample(sample)
+            anchor_samples = self._sample_anchors(tokens, generator)
+            if not anchor_samples:
+                continue
+
+            self._cached_contexts = [item["context_ids"] for item in anchor_samples]
+            self._cached_targets = [item["target_ids"] for item in anchor_samples]
+            self._cache_index = 0
+
+            for cached in self._yield_cached():
+                self.rng_state = generator.get_state()
+                yield cached
+
+            self._reset_cache()
+
+        self.states = self.data.state_dict()
+        self.rng_state = generator.get_state()
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = epoch
+        if hasattr(self.dataset, "set_epoch"):
+            self.dataset.set_epoch(epoch)
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "states": self.states,
+            "cached_contexts": [ctx.clone() for ctx in self._cached_contexts],
+            "cached_targets": [tgt.clone() for tgt in self._cached_targets],
+            "cache_index": self._cache_index,
+            "rng_state": self.rng_state.clone() if self.rng_state is not None else None,
+            "epoch": self._epoch,
+        }
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        self.states = state_dict.get("states")
+        self._cached_contexts = [ctx.clone() for ctx in state_dict.get("cached_contexts", [])]
+        self._cached_targets = [tgt.clone() for tgt in state_dict.get("cached_targets", [])]
+        self._cache_index = state_dict.get("cache_index", 0)
+        rng_state = state_dict.get("rng_state")
+        self.rng_state = rng_state.clone() if rng_state is not None else None
+        self._epoch = state_dict.get("epoch", 0)
 
 
 class BufferShuffledExamplesIterable(datasets.iterable_dataset.BufferShuffledExamplesIterable):
@@ -544,15 +761,8 @@ class DataCollatorForLanguageModeling:
 @dataclass
 class DataCollatorForRollout:
     tokenizer: PreTrainedTokenizer
-    anchors_per_sample: int
-    rollout_length: int
-    max_context_tokens: Optional[int] = None
 
-    def __post_init__(self):
-        if self.anchors_per_sample <= 0:
-            raise ValueError("anchors_per_sample must be positive")
-        if self.rollout_length <= 0:
-            raise ValueError("rollout_length must be positive")
+    def __post_init__(self) -> None:
         if self.tokenizer.pad_token_id is not None:
             self.pad_token_id = self.tokenizer.pad_token_id
         elif self.tokenizer.eos_token_id is not None:
@@ -569,69 +779,27 @@ class DataCollatorForRollout:
             return torch.from_numpy(values).to(dtype=torch.long)
         return torch.tensor(values, dtype=torch.long)
 
-    def __call__(self, examples: List[Union[List[int], Dict[str, Any]]]) -> Dict[str, Any]:
+    def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not examples:
+            raise ValueError("Empty batch provided to rollout collator")
+
         contexts: List[torch.Tensor] = []
         targets: List[torch.Tensor] = []
-        context_lengths: List[int] = []
 
         for example in examples:
-            if not isinstance(example, Dict):
-                tokens = self._tensorize(example)
-            else:
-                tokens = self._tensorize(example["input_ids"])
-
-            total_len = tokens.numel()
-            if total_len <= self.rollout_length + 1:
-                continue
-
-            max_start = total_len - self.rollout_length
-            candidates = torch.arange(1, max_start + 1, dtype=torch.long)
-            if candidates.numel() == 0:
-                continue
-            num_samples = min(self.anchors_per_sample, candidates.numel())
-            selected = candidates[torch.randperm(candidates.numel())[:num_samples]]
-            selected, _ = torch.sort(selected)
-
-            for start in selected.tolist():
-                context = tokens[:start]
-                if context.numel() == 0:
-                    continue
-                if self.max_context_tokens is not None and context.numel() > self.max_context_tokens:
-                    context = context[-self.max_context_tokens :]
-                target = tokens[start : start + self.rollout_length]
-                if target.numel() != self.rollout_length:
-                    continue
-                contexts.append(context)
-                targets.append(target)
-                context_lengths.append(context.numel())
-
-        if not contexts:
-            # fallback: use the tail of the last example if possible
-            for example in reversed(examples):
-                tokens = (
-                    self._tensorize(example)
-                    if not isinstance(example, Dict)
-                    else self._tensorize(example["input_ids"])
+            if "context_ids" not in example or "target_ids" not in example:
+                raise KeyError(
+                    "Rollout collator expects examples with 'context_ids' and 'target_ids' keys"
                 )
-                total_len = tokens.numel()
-                if total_len <= self.rollout_length + 1:
-                    continue
-                start = max(1, total_len - self.rollout_length - 1)
-                context = tokens[:start]
-                if context.numel() == 0:
-                    continue
-                if self.max_context_tokens is not None and context.numel() > self.max_context_tokens:
-                    context = context[-self.max_context_tokens :]
-                target = tokens[start : start + self.rollout_length]
-                if target.numel() != self.rollout_length:
-                    continue
-                contexts.append(context)
-                targets.append(target)
-                context_lengths.append(context.numel())
-                break
+            context = self._tensorize(example["context_ids"])
+            target = self._tensorize(example["target_ids"])
+            if context.numel() == 0:
+                continue
+            contexts.append(context)
+            targets.append(target)
 
         if not contexts:
-            raise ValueError("Unable to sample rollout anchors from the provided batch")
+            raise ValueError("Unable to collate rollout batch without valid contexts")
 
         attention_masks = [torch.ones_like(context, dtype=torch.long) for context in contexts]
         context_input_ids = pad_sequence(
@@ -640,14 +808,19 @@ class DataCollatorForRollout:
         context_attention_mask = pad_sequence(
             attention_masks, batch_first=True, padding_value=0
         )
-        target_ids = torch.stack(targets, dim=0)
-        context_lengths_tensor = torch.tensor(context_lengths, dtype=torch.long)
+        context_lengths = torch.tensor([context.size(0) for context in contexts], dtype=torch.long)
+
+        target_lengths = {target.size(0) for target in targets}
+        if len(target_lengths) == 1:
+            target_ids = torch.stack(targets, dim=0)
+        else:
+            target_ids = pad_sequence(targets, batch_first=True, padding_value=self.pad_token_id)
 
         return {
             "context_input_ids": context_input_ids,
             "context_attention_mask": context_attention_mask,
             "target_ids": target_ids,
-            "context_lengths": context_lengths_tensor,
+            "context_lengths": context_lengths,
         }
 
 
@@ -898,21 +1071,25 @@ def build_dataloader(
     persistent_workers: bool = False,
     snapshot_every_n_steps: Optional[int] = 1,
 ):
-    dataset = OnlineTokenizedIterableDataset(
-        dataset=dataset, tokenizer=tokenizer, seq_len=seq_len, rank=rank, world_size=world_size
-    )
     if rl_enabled and varlen:
         raise ValueError("Variable length batching is not supported with GRPO training")
 
     collate_fn: Callable
     if rl_enabled:
-        collate_fn = DataCollatorForRollout(
+        dataset = RolloutAnchorIterableDataset(
+            dataset=dataset,
             tokenizer=tokenizer,
             anchors_per_sample=rl_anchors_per_sample,
             rollout_length=rl_rollout_length,
             max_context_tokens=rl_max_context_tokens,
+            rank=rank,
+            world_size=world_size,
         )
+        collate_fn = DataCollatorForRollout(tokenizer=tokenizer)
     else:
+        dataset = OnlineTokenizedIterableDataset(
+            dataset=dataset, tokenizer=tokenizer, seq_len=seq_len, rank=rank, world_size=world_size
+        )
         collate_fn = DataCollatorForLanguageModeling(
             tokenizer=tokenizer, context_len=context_len, varlen=varlen
         )
