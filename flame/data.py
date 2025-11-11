@@ -6,6 +6,7 @@ import copy
 import pickle
 from copy import deepcopy
 from dataclasses import dataclass
+from collections.abc import Sequence
 from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 
 import datasets
@@ -20,6 +21,50 @@ from transformers import PreTrainedTokenizer
 
 from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
+
+
+def _stringify_sequence(sequence: Sequence[Any]) -> str:
+    """Convert a sequence of items to a string with newline separation."""
+
+    return '\n'.join(str(item) for item in sequence)
+
+
+def _serialize_conversations(conversations: Any) -> str:
+    """Convert a conversation structure into a plain string."""
+
+    if isinstance(conversations, str):
+        return conversations
+    if isinstance(conversations, Sequence) and not isinstance(conversations, (str, bytes, bytearray)):
+        parts: List[str] = []
+        for turn in conversations:
+            if isinstance(turn, dict):
+                speaker = turn.get('from') or turn.get('role') or turn.get('speaker') or ''
+                value = turn.get('value') or turn.get('content') or turn.get('text') or ''
+                text = str(value)
+                parts.append(f"{speaker}: {text}" if speaker else text)
+            else:
+                parts.append(str(turn))
+        return '\n'.join(parts)
+    return str(conversations)
+
+
+def _extract_text(sample: Dict[str, Any]) -> str:
+    """Extract textual content from a dataset sample."""
+
+    if sample.get('text') not in (None, ''):
+        text = sample['text']
+    elif sample.get('content') not in (None, ''):
+        text = sample['content']
+    elif sample.get('conversations') is not None:
+        text = _serialize_conversations(sample['conversations'])
+    else:
+        raise ValueError(f"No usable text field found in sample:\n{sample}")
+
+    if isinstance(text, str):
+        return text
+    if isinstance(text, Sequence) and not isinstance(text, (str, bytes, bytearray)):
+        return _stringify_sequence(text)
+    return str(text)
 
 
 class BufferShuffledIterableDataset(IterableDataset):
@@ -94,7 +139,8 @@ class BufferShuffledIterableDataset(IterableDataset):
     def tokenize(self, data, batch_size: int = 64):
         texts, states = [], []
         for sample in data:
-            texts.append(sample['text'])
+            text = _extract_text(sample)
+            texts.append(text)
             states.append(self.data.state_dict())
             if len(texts) == batch_size:
                 for s, tokenized in zip(states, self.tokenizer(texts, return_attention_mask=False)['input_ids']):
@@ -186,12 +232,8 @@ class OnlineTokenizedIterableDataset(IterableDataset):
     def tokenize(self, data, buffer_size: int = 64):
         buffer, states = [], []
         for sample in data:
-            if sample.get('text', None) is not None:
-                buffer.append(sample['text'])
-            elif sample.get('content', None) is not None:
-                buffer.append(sample['content'])
-            else:
-                raise ValueError(f"No 'text' or 'content' field found in sample:\n{sample}")
+            text = _extract_text(sample)
+            buffer.append(text)
             states.append(self.data.state_dict())
             if len(buffer) == buffer_size:
                 for s, tokenized in zip(states, self.tokenizer(buffer, return_attention_mask=False)['input_ids']):
